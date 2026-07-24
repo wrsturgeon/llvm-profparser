@@ -50,6 +50,8 @@ impl CoverageMappingInfo {
 pub struct ProfileData {
     pub name_md5: u64,
     pub structural_hash: u64,
+    /// Index of this function's first counter in the profile counter section.
+    pub counters_offset: u64,
     pub counters_len: u32,
 }
 

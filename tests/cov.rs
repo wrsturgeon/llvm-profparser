@@ -1,6 +1,6 @@
 use assert_cmd::cargo::cargo_bin;
 use cargo_metadata::Message;
-use llvm_profparser::{parse, CoverageMapping};
+use llvm_profparser::{coverage::coverage_mapping::read_object_file, parse, CoverageMapping};
 use pretty_assertions::assert_eq;
 use regex::Regex;
 
@@ -291,4 +291,21 @@ fn check_mapping_consistency() {
             .sum::<usize>();
         assert_eq!(expected_len, counts);
     }
+}
+
+#[test]
+fn profile_data_includes_counter_offsets() {
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/cov");
+    let object = example.join("simple_project");
+    let profile = parse(example.join("simple_project.profraw")).unwrap();
+    let mapping = read_object_file(&object, profile.version().unwrap()).unwrap();
+    let profile_data = mapping.prof_data.unwrap();
+
+    assert_eq!(
+        profile_data
+            .iter()
+            .map(|record| (record.counters_offset, record.counters_len))
+            .collect::<Vec<_>>(),
+        vec![(0, 2), (2, 2), (4, 3), (7, 2), (9, 2)],
+    );
 }

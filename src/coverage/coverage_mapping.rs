@@ -11,7 +11,7 @@ use std::fmt;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
 /// Stores the instrumentation profile and information from the coverage mapping sections in the
 /// object files in order to construct a coverage report. Inspired, from the LLVM implementation
@@ -47,6 +47,7 @@ pub enum SectionReadError {
     EmptySection(LlvmSection),
     MissingSection(LlvmSection),
     InvalidPathList,
+    InvalidProfileData,
 }
 
 impl fmt::Display for SectionReadError {
@@ -55,6 +56,7 @@ impl fmt::Display for SectionReadError {
             Self::EmptySection(s) => write!(f, "empty section: {:?}", s),
             Self::MissingSection(s) => write!(f, "missing section: {:?}", s),
             Self::InvalidPathList => write!(f, "unable to read path list"),
+            Self::InvalidProfileData => write!(f, "invalid profile data"),
         }
     }
 }
@@ -67,17 +69,30 @@ pub fn read_object_file(object: &Path, version: u64) -> Result<CoverageMappingIn
     let binary_data = ReadCache::new(BufReader::new(fs::File::open(object)?));
     let object_file = object::File::parse(&binary_data)?;
 
-    let prof_counts = object_file
+    let prof_counts_section = object_file
         .section_by_name("__llvm_prf_cnts")
-        .or(object_file.section_by_name(".lprfc"))
-        .and_then(|x| parse_profile_counters(object_file.endianness(), &x).ok());
+        .or(object_file.section_by_name(".lprfc"));
+    let prof_counts = prof_counts_section
+        .as_ref()
+        .and_then(|section| parse_profile_counters(object_file.endianness(), section).ok());
 
     debug!("Parsed prf_cnts: {:?}", prof_counts);
 
     let prof_data = object_file
         .section_by_name("__llvm_prf_data")
         .or(object_file.section_by_name(".lprfd"))
-        .and_then(|x| parse_profile_data(object_file.endianness(), &x).ok());
+        .and_then(|section| {
+            prof_counts_section.as_ref().and_then(|counters_section| {
+                parse_profile_data(
+                    object_file.endianness(),
+                    object_file.is_64(),
+                    &section,
+                    counters_section,
+                    version,
+                )
+                .ok()
+            })
+        });
 
     debug!("Parsed prf_data section: {:?}", prof_data);
 
@@ -539,45 +554,80 @@ fn parse_mapping_regions<'a>(
 
 fn parse_profile_data<'data, R: ReadRef<'data>>(
     endian: Endianness,
+    is_64: bool,
     section: &Section<'data, '_, R>,
+    counters_section: &Section<'data, '_, R>,
+    version: u64,
 ) -> Result<Vec<ProfileData>, SectionReadError> {
-    if let Ok(data) = section.data() {
-        let mut bytes = data;
-        let mut res = vec![];
-        while !bytes.is_empty() {
-            // bytes.len() >= 24 {
-            let name_md5 = endian.read_u64(bytes[..8].try_into().unwrap());
-            let structural_hash = endian.read_u64(bytes[8..16].try_into().unwrap());
-
-            let _counter_ptr = endian.read_u64(bytes[16..24].try_into().unwrap());
-            let counters_location = 24 + 16;
-            if bytes.len() <= counters_location {
-                bytes = &bytes[counters_location..];
-                let counters_len = endian.read_u32(bytes[..4].try_into().unwrap());
-                // TODO Might need to get the counter offset and get the list of counters from this?
-                // And potentially check against the maximum number of counters just to make sure that
-                // it's not being exceeded?
-                //
-                // Also counters_len >= 1 so this should be checked to make sure it's not malformed
-
-                bytes = &bytes[8..];
-
-                res.push(ProfileData {
-                    name_md5,
-                    structural_hash,
-                    counters_len,
-                });
-            } else {
-                bytes = &[];
-            }
-        }
-        if !bytes.is_empty() {
-            warn!("{} bytes left in profile data", bytes.len());
-        }
-        Ok(res)
-    } else {
-        Err(SectionReadError::EmptySection(LlvmSection::ProfileData))
+    let data = section
+        .data()
+        .map_err(|_| SectionReadError::EmptySection(LlvmSection::ProfileData))?;
+    if data.is_empty() {
+        return Err(SectionReadError::EmptySection(LlvmSection::ProfileData));
     }
+
+    let pointer_size: usize = if is_64 { 8 } else { 4 };
+    let has_bitmap = version > 8;
+    let pointer_count = if has_bitmap { 4 } else { 3 };
+    let counters_len_offset = 16 + pointer_size * pointer_count;
+    let record_data_len = counters_len_offset + 8 + if has_bitmap { 4 } else { 0 };
+    let record_len = record_data_len.next_multiple_of(pointer_size);
+    if data.len() % record_len != 0 || counters_section.size() % 8 != 0 {
+        return Err(SectionReadError::InvalidProfileData);
+    }
+
+    let counters_address = counters_section.address();
+    let counter_count = counters_section.size() / 8;
+    let mut result = Vec::with_capacity(data.len() / record_len);
+
+    for (record_index, bytes) in data.chunks_exact(record_len).enumerate() {
+        let name_md5 = endian.read_u64(bytes[..8].try_into().unwrap());
+        let structural_hash = endian.read_u64(bytes[8..16].try_into().unwrap());
+        let counter_ptr = if is_64 {
+            endian.read_i64(bytes[16..24].try_into().unwrap())
+        } else {
+            i64::from(endian.read_i32(bytes[16..20].try_into().unwrap()))
+        };
+        let counters_len = endian.read_u32(
+            bytes[counters_len_offset..counters_len_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+
+        let record_offset = u64::try_from(record_index)
+            .ok()
+            .and_then(|index| index.checked_mul(u64::try_from(record_len).ok()?))
+            .ok_or(SectionReadError::InvalidProfileData)?;
+        let record_address = section
+            .address()
+            .checked_add(record_offset)
+            .ok_or(SectionReadError::InvalidProfileData)?;
+        let counter_address = record_address
+            .checked_add_signed(counter_ptr)
+            .ok_or(SectionReadError::InvalidProfileData)?;
+        let counter_byte_offset = counter_address
+            .checked_sub(counters_address)
+            .ok_or(SectionReadError::InvalidProfileData)?;
+        if counter_byte_offset % 8 != 0 {
+            return Err(SectionReadError::InvalidProfileData);
+        }
+        let counters_offset = counter_byte_offset / 8;
+        let counters_end = counters_offset
+            .checked_add(u64::from(counters_len))
+            .ok_or(SectionReadError::InvalidProfileData)?;
+        if counters_len == 0 || counters_end > counter_count {
+            return Err(SectionReadError::InvalidProfileData);
+        }
+
+        result.push(ProfileData {
+            name_md5,
+            structural_hash,
+            counters_offset,
+            counters_len,
+        });
+    }
+
+    Ok(result)
 }
 
 fn parse_profile_counters<'data, R: ReadRef<'data>>(
